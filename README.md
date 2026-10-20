@@ -8,16 +8,31 @@ Drives Microsoft 365 Copilot Chat (ITS student cloud mail) over a **dedicated he
 
 ### 1. Install the Extension
 
-**Option A — Link from a local clone (recommended for development):**
+**Option A — Install as an `omp` plugin (recommended):**
 ```bash
-git clone https://github.com/alfiwillianz/omp-copilot-its.git ~/Projects/omp-copilot-its
-omp plugin link ~/Projects/omp-copilot-its
+omp plugin install git+https://github.com/alfiwillianz/omp-copilot-its.git
+```
+This clones the package into `~/.omp/plugins/node_modules/omp-copilot-its` and registers it in `omp-plugins.lock.json`. Restart `omp` (or `/reload-plugins`) to pick it up. No local checkout or personal path required.
+
+Verify it loaded:
+```bash
+omp plugin list          # should list omp-copilot-its
+omp --model copilot-its/gpt-6.1-sol -p "Reply with ONLY: OK"
 ```
 
-**Option B — Load directly via `~/.omp/agent/config.yml`:**
+**Option B — Link a local clone (for development):**
+```bash
+git clone https://github.com/alfiwillianz/omp-copilot-its.git
+cd omp-copilot-its
+omp plugin link .
+```
+`omp plugin link` symlinks the working tree into `~/.omp/plugins/node_modules`, so edits apply on the next session.
+
+**Option C — Load a single module via config:**
 ```yaml
+# ~/.omp/agent/config.yml
 extensions:
-  - ~/Projects/omp-copilot-its/extensions/copilot-its.ts
+  - ~/.omp/plugins/node_modules/omp-copilot-its/extensions/copilot-its.ts
 ```
 
 ---
