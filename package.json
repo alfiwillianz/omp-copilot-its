@@ -1,0 +1,55 @@
+{
+  "name": "omp-copilot-its",
+  "version": "0.1.0",
+  "description": "Microsoft 365 Copilot Chat (ITS cloud mail) provider & session manager extension for omp (oh-my-pi)",
+  "author": {
+    "name": "alfiwillianz",
+    "url": "https://github.com/alfiwillianz"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alfiwillianz/omp-copilot-its.git"
+  },
+  "homepage": "https://github.com/alfiwillianz/omp-copilot-its#readme",
+  "bugs": "https://github.com/alfiwillianz/omp-copilot-its/issues",
+  "keywords": [
+    "omp",
+    "oh-my-pi",
+    "omp-extension",
+    "extension",
+    "copilot",
+    "m365-copilot",
+    "provider",
+    "its"
+  ],
+  "type": "module",
+  "main": "extensions/copilot-its.ts",
+  "omp": {
+    "extensions": [
+      "./extensions/copilot-its.ts"
+    ]
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/copilot-its.ts"
+    ]
+  },
+  "files": [
+    "extensions/*.ts",
+    "src/**/*.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-ai": "18.12.1",
+    "@oh-my-pi/pi-coding-agent": "18.12.1",
+    "@types/bun": "^1.4.3",
+    "@types/node": "^26.3.0",
+    "typescript": "^7.0.2"
+  }
+}
