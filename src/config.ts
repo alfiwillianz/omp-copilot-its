@@ -21,9 +21,12 @@ export interface CopilotCookieStore {
 	cookies: CopilotCookie[];
 }
 
+export type BrowserBackendMode = "standalone-chromium" | "obscura" | "relay";
+
 export interface CopilotItsConfig {
 	email: string;
 	defaultModel: string;
+	browserBackend: BrowserBackendMode;
 	cdpUrl: string;
 	relayHttpUrl: string;
 	setupServerPort: number;
@@ -37,10 +40,13 @@ const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "ag
 export const CONFIG_PATH = join(AGENT_DIR, "copilot-its-config.json");
 export const COOKIES_PATH = join(AGENT_DIR, "copilot-its-cookies.json");
 export const PROFILE_DIR = join(AGENT_DIR, "copilot-its-profile");
+export const OBSCURA_BIN_DIR = join(AGENT_DIR, "bin");
 
 export const DEFAULT_CONFIG: CopilotItsConfig = {
 	email: process.env.COPILOT_ITS_EMAIL || "5054251028@student.its.ac.id",
 	defaultModel: process.env.COPILOT_ITS_MODEL || "gpt-6.1-sol",
+	browserBackend:
+		(process.env.COPILOT_ITS_BACKEND as BrowserBackendMode | undefined) || "standalone-chromium",
 	cdpUrl: process.env.COPILOT_ITS_CDP_URL || "ws://127.0.0.1:9224/cdp",
 	relayHttpUrl: process.env.COPILOT_ITS_RELAY_HTTP || "http://127.0.0.1:9224",
 	setupServerPort: Number(process.env.COPILOT_ITS_SETUP_PORT || 19224),
@@ -69,12 +75,22 @@ export function loadConfig(): CopilotItsConfig {
 	try {
 		if (!existsSync(CONFIG_PATH)) return { ...DEFAULT_CONFIG };
 		const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Partial<CopilotItsConfig>;
+		const validBackends: Record<BrowserBackendMode, true> = {
+			"standalone-chromium": true,
+			obscura: true,
+			relay: true,
+		};
+		const backendCandidate = raw.browserBackend;
 		return {
 			email: typeof raw.email === "string" && raw.email.trim() ? raw.email.trim() : DEFAULT_CONFIG.email,
 			defaultModel:
 				typeof raw.defaultModel === "string" && raw.defaultModel.trim()
 					? raw.defaultModel.trim()
 					: DEFAULT_CONFIG.defaultModel,
+			browserBackend:
+				backendCandidate && backendCandidate in validBackends
+					? backendCandidate
+					: DEFAULT_CONFIG.browserBackend,
 			cdpUrl: typeof raw.cdpUrl === "string" && raw.cdpUrl.trim() ? raw.cdpUrl.trim() : DEFAULT_CONFIG.cdpUrl,
 			relayHttpUrl:
 				typeof raw.relayHttpUrl === "string" && raw.relayHttpUrl.trim()

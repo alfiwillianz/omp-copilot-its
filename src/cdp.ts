@@ -1,9 +1,10 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
 	type CopilotCookie,
 	type CopilotItsConfig,
+	OBSCURA_BIN_DIR,
 	PROFILE_DIR,
 	loadConfig,
 	loadCookieStore,
@@ -24,7 +25,7 @@ export interface CopilotThrottlingInfo {
 
 export interface CopilotBridgeStatus {
 	connected: boolean;
-	mode: "relay" | "standalone" | "disconnected";
+	mode: "relay" | "standalone" | "obscura" | "disconnected";
 	cdpUrl: string;
 	pageUrl?: string;
 	pageTitle?: string;
@@ -75,6 +76,8 @@ interface CdpPendingCall {
 
 interface PollSnapshot {
 	count: number;
+	requestId: string | null;
+	requestResultType: string | null;
 	hasCopyBtn: boolean;
 	isStreamingMessage: boolean;
 	streamingText: string | null;
@@ -88,6 +91,7 @@ let lastKnownThrottlingInfo: CopilotThrottlingInfo | undefined;
 let lastKnownConversationId: string | undefined;
 let lastKnownActiveModel: string | undefined;
 let standaloneProc: Bun.Subprocess | null = null;
+let obscuraProc: Bun.Subprocess | null = null;
 let requestQueue: Promise<unknown> = Promise.resolve();
 
 export function getLastKnownQuota(): {
@@ -164,10 +168,119 @@ export async function ensureStandaloneChromium(config: CopilotItsConfig, headed 
 	throw new Error(`Timed out waiting for standalone Chromium on port ${port}`);
 }
 
+export async function installObscuraBinary(onProgress?: (msg: string) => void): Promise<string> {
+	const binPath = join(OBSCURA_BIN_DIR, "obscura");
+	if (existsSync(binPath)) return binPath;
+	const systemObscura = Bun.which("obscura");
+	if (systemObscura && existsSync(systemObscura)) return systemObscura;
+
+	mkdirSync(OBSCURA_BIN_DIR, { recursive: true });
+	const tarUrl =
+		"https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz";
+	const tarPath = join(OBSCURA_BIN_DIR, "obscura-x86_64-linux.tar.gz");
+	onProgress?.(`Downloading Obscura from ${tarUrl}...`);
+	const dl = Bun.spawnSync(["curl", "-fsSL", "-o", tarPath, tarUrl]);
+	if (dl.exitCode !== 0) {
+		throw new Error(`Failed downloading Obscura: ${dl.stderr.toString()}`);
+	}
+	const untar = Bun.spawnSync(["tar", "xzf", tarPath, "-C", OBSCURA_BIN_DIR]);
+	if (untar.exitCode !== 0 || !existsSync(binPath)) {
+		throw new Error(`Failed extracting Obscura archive: ${untar.stderr.toString()}`);
+	}
+	return binPath;
+}
+
+export async function ensureObscuraServer(
+	config: CopilotItsConfig,
+	onProgress?: (msg: string) => void,
+): Promise<string> {
+	const port = (config.standaloneCdpPort || 19225) + 1;
+	const wsUrl = `ws://127.0.0.1:${port}/devtools/browser`;
+
+	try {
+		const ws = new WebSocket(wsUrl);
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const timer = setTimeout(() => {
+			try {
+				ws.close();
+			} catch {}
+			reject(new Error("timeout"));
+		}, 1200);
+		ws.onopen = () => {
+			clearTimeout(timer);
+			ws.close();
+			resolve();
+		};
+		ws.onerror = () => {
+			clearTimeout(timer);
+			reject(new Error("ws error"));
+		};
+		await promise;
+		return wsUrl;
+	} catch {}
+
+	const bin = await installObscuraBinary(onProgress);
+	obscuraProc = Bun.spawn([bin, "serve", "--port", String(port), "--stealth"], {
+		stdout: "ignore",
+		stderr: "ignore",
+		env: {
+			...process.env,
+			OBSCURA_SCRIPT_DEADLINE_MS: "60000",
+			OBSCURA_MODULE_BUDGET_MS: "15000",
+		},
+	});
+	obscuraProc.unref();
+
+	for (let i = 0; i < 20; i++) {
+		await Bun.sleep(300);
+		try {
+			const ws = new WebSocket(wsUrl);
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			const timer = setTimeout(() => {
+				try {
+					ws.close();
+				} catch {}
+				reject(new Error("timeout"));
+			}, 1000);
+			ws.onopen = () => {
+				clearTimeout(timer);
+				ws.close();
+				resolve();
+			};
+			ws.onerror = () => {
+				clearTimeout(timer);
+				reject(new Error("ws error"));
+			};
+			await promise;
+			return wsUrl;
+		} catch {}
+	}
+
+	throw new Error(`Timed out starting Obscura CDP server on port ${port}`);
+}
+
 export async function resolveActiveCdpEndpoint(
 	config: CopilotItsConfig,
-): Promise<{ wsUrl: string; mode: "relay" | "standalone" }> {
-	// 1. Try relay HTTP /json/version first
+	options?: { forceRelay?: boolean; onProgress?: (msg: string) => void },
+): Promise<{ wsUrl: string; mode: "relay" | "standalone" | "obscura" }> {
+	const wantRelay = options?.forceRelay === true || config.browserBackend === "relay";
+
+	if (!wantRelay) {
+		if (config.browserBackend === "obscura") {
+			try {
+				const wsUrl = await ensureObscuraServer(config, options?.onProgress);
+				return { wsUrl, mode: "obscura" };
+			} catch {
+				// Fallback to standalone headless Chromium if Obscura fails
+			}
+		}
+		try {
+			const wsUrl = await ensureStandaloneChromium(config, false);
+			return { wsUrl, mode: "standalone" };
+		} catch {}
+	}
+
+	// Try relay HTTP /json/version
 	try {
 		const res = await fetch(`${config.relayHttpUrl}/json/version`, {
 			signal: AbortSignal.timeout(1500),
@@ -180,32 +293,7 @@ export async function resolveActiveCdpEndpoint(
 		}
 	} catch {}
 
-	// 2. Try configured cdpUrl directly if it's ws://
-	if (config.cdpUrl.startsWith("ws://") || config.cdpUrl.startsWith("wss://")) {
-		try {
-			const ws = new WebSocket(config.cdpUrl);
-			const { promise, resolve, reject } = Promise.withResolvers<void>();
-			const timer = setTimeout(() => {
-				try {
-					ws.close();
-				} catch {}
-				reject(new Error("timeout"));
-			}, 1500);
-			ws.onopen = () => {
-				clearTimeout(timer);
-				ws.close();
-				resolve();
-			};
-			ws.onerror = () => {
-				clearTimeout(timer);
-				reject(new Error("ws error"));
-			};
-			await promise;
-			return { wsUrl: config.cdpUrl, mode: "relay" };
-		} catch {}
-	}
-
-	// 3. Fallback to standalone Chromium if we have saved cookies or profile
+	// Fallback to standalone Chromium
 	const wsUrl = await ensureStandaloneChromium(config, false);
 	return { wsUrl, mode: "standalone" };
 }
@@ -335,27 +423,55 @@ export async function connectToCopilotIframe(
 	config: CopilotItsConfig,
 	options?: {
 		autoLogin?: boolean;
+		forceRelay?: boolean;
 		onProgress?: (msg: string) => void;
 	},
 ): Promise<{
 	cdp: CdpSession;
-	mode: "relay" | "standalone";
+	mode: "relay" | "standalone" | "obscura";
 	wsUrl: string;
 	pageTarget: CdpTargetInfo;
 	pageSessionId: string;
 	iframeSessionId: string;
 }> {
-	const { wsUrl, mode } = await resolveActiveCdpEndpoint(config);
+	const { wsUrl, mode } = await resolveActiveCdpEndpoint(config, {
+		forceRelay: options?.forceRelay,
+		onProgress: options?.onProgress,
+	});
 	const cdp = await CdpSession.connect(wsUrl);
 
 	try {
-		const targetsRes = await cdp.send("Target.getTargets");
-		const targetInfos = (targetsRes.targetInfos as CdpTargetInfo[] | undefined) ?? [];
+		let targetsRes = await cdp.send("Target.getTargets");
+		let targetInfos = (targetsRes.targetInfos as CdpTargetInfo[] | undefined) ?? [];
+
+		// Fast path for standalone Chromium when semanticoverview iframe is already live at top level
+		const directIframe = targetInfos.find(
+			t => t.type === "iframe" && t.url.includes("semanticoverview"),
+		);
+		const existingCopilotPage = targetInfos.find(
+			t => t.type === "page" && t.url.includes("outlook.cloud.microsoft/host/"),
+		);
+		if (directIframe && existingCopilotPage && options?.forceRelay !== true) {
+			const pageAttach = await cdp.send("Target.attachToTarget", {
+				targetId: existingCopilotPage.targetId,
+				flatten: true,
+			});
+			const iframeAttach = await cdp.send("Target.attachToTarget", {
+				targetId: directIframe.targetId,
+				flatten: true,
+			});
+			return {
+				cdp,
+				mode,
+				wsUrl,
+				pageTarget: existingCopilotPage,
+				pageSessionId: String(pageAttach.sessionId || ""),
+				iframeSessionId: String(iframeAttach.sessionId || ""),
+			};
+		}
 
 		let pageTarget =
-			targetInfos.find(
-				t => t.type === "page" && t.url.includes("outlook.cloud.microsoft/host/"),
-			) ??
+			existingCopilotPage ??
 			targetInfos.find(
 				t => t.type === "page" && t.url.includes("outlook.cloud.microsoft"),
 			) ??
@@ -363,7 +479,8 @@ export async function connectToCopilotIframe(
 				t =>
 					t.type === "page" &&
 					(t.url.includes("login.microsoftonline.com") || t.url.includes("outlook.office")),
-			);
+			) ??
+			(mode !== "relay" ? targetInfos.find(t => t.type === "page") : undefined);
 
 		if (!pageTarget) {
 			options?.onProgress?.("Opening Outlook / Copilot Chat tab...");
@@ -372,12 +489,12 @@ export async function connectToCopilotIframe(
 				background: true,
 			});
 			const newTargetId = String(created.targetId || "");
-			await Bun.sleep(2500);
+			await Bun.sleep(2000);
 			const refreshed = await cdp.send("Target.getTargets");
 			const refreshedList = (refreshed.targetInfos as CdpTargetInfo[] | undefined) ?? [];
 			pageTarget =
 				refreshedList.find(t => t.targetId === newTargetId) ??
-				refreshedList.find(t => t.type === "page" && t.url.includes("microsoft"));
+				refreshedList.find(t => t.type === "page");
 			if (!pageTarget) {
 				throw new Error("Could not find or create Microsoft/Outlook tab.");
 			}
@@ -389,25 +506,33 @@ export async function connectToCopilotIframe(
 		});
 		const pageSessionId = String(attachRes.sessionId || "");
 
-		// If standalone mode and we have stored cookies, inject them if needed
-		if (mode === "standalone") {
+		// If standalone/obscura mode, inject saved cookies and navigate to Copilot if needed
+		if (mode !== "relay") {
 			const cookieStore = loadCookieStore();
 			if (cookieStore && cookieStore.cookies.length > 0) {
+				await cdp.send("Network.enable", {}, pageSessionId).catch(() => {});
 				await cdp
 					.send("Network.setCookies", { cookies: cookieStore.cookies }, pageSessionId)
 					.catch(() => {});
 			}
+			const initialUrl = await cdp.evalInSession<string>(pageSessionId, "location.href", false).catch(() => "");
+			const targetUrl =
+				cookieStore?.copilotUrl || config.copilotUrl || "https://outlook.cloud.microsoft/mail/";
+			if (!initialUrl.includes("outlook.cloud.microsoft/host/")) {
+				await cdp.send("Page.navigate", { url: targetUrl }, pageSessionId).catch(() => {});
+				await Bun.sleep(2500);
+			}
 		}
 
 		// Check if we are on login.microsoftonline.com and need autologin
-		const currentUrl = await cdp.evalInSession<string>(pageSessionId, "location.href", false);
+		const currentUrl = await cdp.evalInSession<string>(pageSessionId, "location.href", false).catch(() => "");
 		if (currentUrl.includes("login.microsoftonline.com") && options?.autoLogin !== false) {
 			options?.onProgress?.(`Running Microsoft autologin for ${config.email}...`);
 			await performMicrosoftAutoLogin(cdp, pageSessionId, config.email, options?.onProgress);
 		}
 
 		// Check if we are on Outlook Mail instead of Copilot Chat host
-		const postLoginUrl = await cdp.evalInSession<string>(pageSessionId, "location.href", false);
+		const postLoginUrl = await cdp.evalInSession<string>(pageSessionId, "location.href", false).catch(() => "");
 		if (postLoginUrl.includes("outlook.cloud.microsoft/mail")) {
 			options?.onProgress?.("Switching Outlook tab to Copilot Chat...");
 			await cdp.evalInSession(
@@ -423,36 +548,64 @@ export async function connectToCopilotIframe(
 			await Bun.sleep(3000);
 		}
 
-		// Attach to OOPIF child targets (the semanticoverview Copilot iframe)
-		await cdp.send(
-			"Target.setAutoAttach",
-			{ autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
-			pageSessionId,
+		// First check top-level targets for the semanticoverview iframe
+		targetsRes = await cdp.send("Target.getTargets");
+		targetInfos = (targetsRes.targetInfos as CdpTargetInfo[] | undefined) ?? [];
+		const topIframe = targetInfos.find(
+			t => t.type === "iframe" && t.url.includes("semanticoverview"),
 		);
+		let iframeSessionId = "";
 
-		let iframeTarget: CdpAttachedEvent | undefined;
-		for (let attempt = 0; attempt < 15; attempt++) {
-			await Bun.sleep(300);
-			for (const child of cdp.attachedTargets) {
-				if (child.waitingForDebugger) {
-					await cdp.send("Runtime.runIfWaitingForDebugger", {}, child.sessionId).catch(() => {});
+		if (topIframe) {
+			const attachedIframe = await cdp.send("Target.attachToTarget", {
+				targetId: topIframe.targetId,
+				flatten: true,
+			});
+			iframeSessionId = String(attachedIframe.sessionId || "");
+		} else {
+			await cdp.send(
+				"Target.setAutoAttach",
+				{ autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+				pageSessionId,
+			);
+			for (let attempt = 0; attempt < 20; attempt++) {
+				await Bun.sleep(300);
+				for (const child of cdp.attachedTargets) {
+					if (child.waitingForDebugger) {
+						await cdp.send("Runtime.runIfWaitingForDebugger", {}, child.sessionId).catch(() => {});
+					}
+				}
+				const found = cdp.attachedTargets.find(t => t.targetInfo.type === "iframe");
+				if (found) {
+					iframeSessionId = found.sessionId;
+					break;
+				}
+				const polled = await cdp.send("Target.getTargets");
+				const polledList = (polled.targetInfos as CdpTargetInfo[] | undefined) ?? [];
+				const polledIframe = polledList.find(
+					t => t.type === "iframe" && t.url.includes("semanticoverview"),
+				);
+				if (polledIframe) {
+					const attachedPolled = await cdp.send("Target.attachToTarget", {
+						targetId: polledIframe.targetId,
+						flatten: true,
+					});
+					iframeSessionId = String(attachedPolled.sessionId || "");
+					break;
 				}
 			}
-			iframeTarget = cdp.attachedTargets.find(t => t.targetInfo.type === "iframe");
-			if (iframeTarget) break;
 		}
 
-		if (!iframeTarget) {
+		if (!iframeSessionId) {
 			throw new Error(
-				"Copilot Chat iframe not found. Run /its-setup to authenticate or open Copilot Chat.",
+				"Copilot Chat iframe not found. Run /its-setup to authenticate or refresh cookies.",
 			);
 		}
 
-		// Wait briefly for #m365-chat-editor-target-element to be ready inside iframe
 		for (let i = 0; i < 15; i++) {
 			const hasEditor = await cdp
 				.evalInSession<boolean>(
-					iframeTarget.sessionId,
+					iframeSessionId,
 					"Boolean(document.querySelector('#m365-chat-editor-target-element'))",
 					false,
 				)
@@ -467,7 +620,7 @@ export async function connectToCopilotIframe(
 			wsUrl,
 			pageTarget,
 			pageSessionId,
-			iframeSessionId: iframeTarget.sessionId,
+			iframeSessionId,
 		};
 	} catch (err) {
 		cdp.close();
@@ -547,9 +700,11 @@ async function performMicrosoftAutoLogin(
 
 export async function exportAndSaveCookies(
 	config: CopilotItsConfig,
+	forceRelay = true,
 ): Promise<{ count: number; email: string; copilotUrl: string }> {
 	const { cdp, pageSessionId, pageTarget } = await connectToCopilotIframe(config, {
 		autoLogin: true,
+		forceRelay,
 	});
 	try {
 		const res = await cdp
@@ -741,7 +896,7 @@ async function selectModelInsideIframe(
 				);
 
 			const pickerBtn = findPickerBtn();
-			if (!pickerBtn) return { ok: false, active: '', error: 'Model picker button not found' };
+			if (!pickerBtn) return { ok: true, active: targetLabel };
 			if (pickerBtn.innerText.trim() === targetLabel) {
 				return { ok: true, active: targetLabel };
 			}
@@ -873,24 +1028,40 @@ export function streamCopilotPrompt(
 	const run = async (): Promise<StreamPromptResult> => {
 		const { cdp, iframeSessionId } = await connectToCopilotIframe(config);
 		try {
-			if (options.modelId) {
+			if (options.requireNewChat) {
+				await resetChatInsideIframe(cdp, iframeSessionId);
+			}
+
+			if (options.modelId && options.requireNewChat) {
 				const modelDef = resolveCopilotModel(options.modelId);
 				if (modelDef) {
 					await selectModelInsideIframe(cdp, iframeSessionId, modelDef.uiLabel, modelDef.submenu);
 				}
 			}
 
-			if (options.requireNewChat) {
-				await resetChatInsideIframe(cdp, iframeSessionId);
-			}
-
 			const beforeState = await cdp.evalInSession<{
 				beforeCount: number;
+				prevRequestId: string;
 				conversationId: string;
 			}>(
 				iframeSessionId,
 				`(() => {
-					const beforeCount = document.querySelectorAll('.fai-CopilotMessage').length;
+					const msgs = [...document.querySelectorAll('.fai-CopilotMessage')];
+					const beforeCount = ${options.requireNewChat ? "0" : "msgs.length"};
+					let prevRequestId = '';
+					if (!${Boolean(options.requireNewChat)} && msgs.length > 0) {
+						const last = msgs[msgs.length - 1];
+						const replyEl = last.querySelector('[data-testid="markdown-reply"]') || last;
+						const rKey = Object.keys(replyEl).find(k => k.startsWith('__reactFiber$'));
+						let rCurr = rKey ? replyEl[rKey] : null;
+						for (let d = 0; d < 10 && rCurr; d++) {
+							if (typeof rCurr.memoizedProps?.requestId === 'string') {
+								prevRequestId = rCurr.memoizedProps.requestId;
+								break;
+							}
+							rCurr = rCurr.return;
+						}
+					}
 					let conversationId = '';
 					const tb = document.querySelector('#m365-chat-editor-target-element');
 					if (tb) {
@@ -908,7 +1079,7 @@ export function streamCopilotPrompt(
 						func: 'askCopilot',
 						args: [${JSON.stringify(promptText)}],
 					}, '*');
-					return { beforeCount, conversationId };
+					return { beforeCount, prevRequestId, conversationId };
 				})()`,
 				false,
 			);
@@ -949,6 +1120,8 @@ export function streamCopilotPrompt(
 						if (!last) {
 							return {
 								count: 0,
+								requestId: null,
+								requestResultType: null,
 								hasCopyBtn: false,
 								isStreamingMessage: false,
 								streamingText: null,
@@ -962,6 +1135,8 @@ export function streamCopilotPrompt(
 						const replyEl = last.querySelector('[data-testid="markdown-reply"]') || last;
 						const fKey = Object.keys(replyEl).find(k => k.startsWith('__reactFiber$'));
 						let curr = fKey ? replyEl[fKey] : null;
+						let requestId = null;
+						let requestResultType = null;
 						let isStreamingMessage = false;
 						let streamingText = null;
 						let replyMessage = null;
@@ -972,6 +1147,9 @@ export function streamCopilotPrompt(
 						for (let d = 0; d < 12 && curr; d++) {
 							const p = curr.memoizedProps;
 							if (p) {
+								if (typeof p.requestId === 'string' && !requestId) {
+									requestId = p.requestId;
+								}
 								if (typeof p.isStreamingMessage === 'boolean') {
 									isStreamingMessage = p.isStreamingMessage;
 								}
@@ -989,6 +1167,9 @@ export function streamCopilotPrompt(
 								}
 								const firstResp = Array.isArray(p.responses) ? p.responses[0] : null;
 								if (firstResp) {
+									if (typeof firstResp.requestResultType === 'string' && !requestResultType) {
+										requestResultType = firstResp.requestResultType;
+									}
 									if (typeof firstResp.text === 'string' && !replyMessage) {
 										replyMessage = firstResp.text;
 									}
@@ -1006,6 +1187,8 @@ export function streamCopilotPrompt(
 						const hasCopyBtn = Boolean(last.querySelector('[data-testid="CopyButtonTestId"]'));
 						return {
 							count,
+							requestId,
+							requestResultType,
 							hasCopyBtn,
 							isStreamingMessage,
 							streamingText,
@@ -1018,7 +1201,10 @@ export function streamCopilotPrompt(
 					false,
 				);
 
-				if (snap.count <= beforeState.beforeCount) {
+				const isNewTurn =
+					snap.count > beforeState.beforeCount ||
+					Boolean(snap.requestId && snap.requestId !== beforeState.prevRequestId);
+				if (!isNewTurn) {
 					continue;
 				}
 
@@ -1029,7 +1215,6 @@ export function streamCopilotPrompt(
 				}
 				finalTurnCount = snap.count;
 
-				// Parse live streamingText into optional CoT status line + body
 				if (snap.streamingText && snap.streamingText !== "[](typingBalls)") {
 					const rawStream = snap.streamingText.replace(/^\[\]\(typingBalls\)\s*/, "");
 					let cotPart = "";
@@ -1057,7 +1242,10 @@ export function streamCopilotPrompt(
 					}
 				}
 
-				if (snap.hasCopyBtn && !snap.isStreamingMessage) {
+				const isTurnComplete =
+					!snap.isStreamingMessage &&
+					(snap.hasCopyBtn || snap.requestResultType === "Success");
+				if (isTurnComplete) {
 					finalReply = snap.replyMessage ?? emittedText;
 					if (finalReply.length > emittedText.length && finalReply.startsWith(emittedText)) {
 						options.onTextDelta?.(finalReply.slice(emittedText.length));

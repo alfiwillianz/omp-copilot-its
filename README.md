@@ -2,8 +2,7 @@
 
 Microsoft 365 Copilot Chat (`copilot-its`) provider & session manager extension for `omp` (`oh-my-pi`).
 
-Drives Microsoft 365 Copilot Chat (ITS student cloud mail) over CDP (`omp browser-relay` or standalone Chromium with persisted cookies) and exposes Copilot's models as a native `omp` provider with per-session chat isolation and automatic compaction handoff.
-
+Drives Microsoft 365 Copilot Chat (ITS student cloud mail) over a **dedicated headless browser** (`standalone-chromium` by default or [Obscura](https://github.com/h4ckf0r0day/obscura), plus optional `omp browser-relay` cookie sync) so it never hijacks your visible browser, and exposes Copilot's models as a native `omp` provider with full local tool-calling (`omp_tool_calls`), per-session chat isolation, and automatic compaction handoff.
 ## Features
 
 - **`copilot-its` Provider (`streamSimple`):**
@@ -22,6 +21,4 @@ Drives Microsoft 365 Copilot Chat (ITS student cloud mail) over CDP (`omp browse
   - `/its-new [prompt]` — Start a fresh Copilot Chat (`New chat`) for the active session.
   - `/its-compact [focus]` — Summarize the active conversation, rotate to a new Copilot Chat, and seed the summary into the new session.
   - `/its-status` — Inspect live connection mode, active UI model, conversation ID, saved cookie count, and quota allowances.
-- **Session & Compaction Hooks:**
-  - `session_start` / `session_switch`: Isolates each `omp` session to its own Copilot Chat conversation.
-  - `session_compact`: Automatically rotates to a new Copilot Chat when `omp` compacts context and seeds the compaction summary into the new chat.
+  - `/its-setup [chromium|obscura|relay|capture|server|status]` — Switch headless backend (`standalone-chromium`, `obscura`, or `relay`), capture cookies from `omp browser-relay` into the headless profile, or launch the localhost callback server (`http://127.0.0.1:19224` & `POST /callback`).

@@ -1,6 +1,7 @@
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
+	type BrowserBackendMode,
 	COOKIES_PATH,
 	loadConfig,
 	loadCookieStore,
@@ -8,9 +9,12 @@ import {
 } from "../src/config.js";
 import {
 	type CopilotThrottlingInfo,
+	ensureObscuraServer,
+	ensureStandaloneChromium,
 	exportAndSaveCookies,
 	getCopilotStatus,
 	getLastKnownQuota,
+	installObscuraBinary,
 	startNewCopilotChat,
 	streamCopilotPrompt,
 	switchCopilotModelInUi,
@@ -26,6 +30,7 @@ interface SessionChatState {
 	modelId: string;
 	requireNewChat: boolean;
 	seededMessageCount: number;
+	toolsInjected: boolean;
 	seededSummary?: string;
 }
 
@@ -68,86 +73,184 @@ interface StreamOptions {
 	maxTokens?: number;
 }
 
+function sanitizeUserTextForCopilot(raw: string): string {
+	return raw
+		.replace(
+			/<system-reminder>\s*Today:\s*([^;]+);\s*current working directory:\s*'([^']+)'\.[^<]*<\/system-reminder>/gi,
+			"[Workspace: date=$1, cwd=$2]",
+		)
+		.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
+		.trim();
+}
+
 function extractMessageText(content: string | ContextContentBlock[]): string {
-	if (typeof content === "string") return content;
+	if (typeof content === "string") return sanitizeUserTextForCopilot(content);
 	if (!Array.isArray(content)) return "";
 	const parts: string[] = [];
 	for (const block of content) {
 		if (block.type === "text" && typeof block.text === "string") {
-			parts.push(block.text);
+			const cleaned = sanitizeUserTextForCopilot(block.text);
+			if (cleaned) parts.push(cleaned);
 		} else if (block.type === "toolCall" && typeof block.name === "string") {
-			const argsObj = block.arguments ?? {};
-			const paramsXml = Object.entries(argsObj)
-				.map(([k, v]) => {
-					const serialized = typeof v === "string" ? v : JSON.stringify(v);
-					return `<parameter name="${k}">${serialized}</parameter>`;
-				})
-				.join("");
-			parts.push(`<invoke name="${block.name}">${paramsXml}</invoke>`);
+			parts.push(
+				"```json\n" +
+					JSON.stringify(
+						{
+							omp_tool_calls: [
+								{
+									name: block.name,
+									arguments: block.arguments ?? {},
+								},
+							],
+						},
+						null,
+						2,
+					) +
+					"\n```",
+			);
 		}
 	}
 	return parts.join("\n");
 }
 
+function extractWorkspaceContextFromSystemPrompt(sysRaw: string): string {
+	const lines: string[] = [];
+	const cwdMatch = sysRaw.match(/current working directory:\s*'([^']+)'/i);
+	if (cwdMatch) lines.push(`Current working directory: ${cwdMatch[1]}`);
+	const osMatch = sysRaw.match(/-\s*OS:\s*([^\n]+)/i);
+	if (osMatch) lines.push(`OS: ${osMatch[1].trim()}`);
+	return lines.join("\n");
+}
+
+function buildToolSpecBlock(tools: NonNullable<StreamContext["tools"]>, workspaceInfo: string): string {
+	const compactSchemas = tools.map(t => {
+		const props =
+			t.parameters && typeof t.parameters === "object" && "properties" in t.parameters
+				? (t.parameters.properties as Record<string, { type?: string; description?: string }>)
+				: {};
+		const req =
+			t.parameters && typeof t.parameters === "object" && "required" in t.parameters && Array.isArray(t.parameters.required)
+				? (t.parameters.required as string[])
+				: [];
+		const argSummary: Record<string, string> = {};
+		for (const [k, v] of Object.entries(props ?? {})) {
+			const reqMark = req.includes(k) ? " (required)" : " (optional)";
+			argSummary[k] = `${v?.type || "any"}${reqMark}`;
+		}
+		return `- ${t.name}: ${(t.description || "").split("\n")[0].slice(0, 140)}\n  args: ${JSON.stringify(argSummary)}`;
+	});
+
+	return [
+		"[CLI Output Format Specification]",
+		"Your text response is parsed directly by the user's local terminal coding agent ('omp').",
+		workspaceInfo ? workspaceInfo : "",
+		"IMPORTANT RULES:",
+		"1. Do NOT run commands in your own cloud Python / Code Interpreter sandbox (/mnt/data).",
+		"2. For normal conversation that does not need local tools, reply normally in plain text.",
+		"3. Whenever you need to execute a local tool (bash, read, write, edit, grep, glob, etc.) on the user's machine, output a ```json code block in this exact structure and then STOP your response so the local CLI can run it and return the output in the next turn:",
+		"```json",
+		"{",
+		'  "omp_tool_calls": [',
+		"    {",
+		'      "name": "bash",',
+		'      "arguments": {',
+		'        "i": "Creating testfile",',
+		'        "command": "touch testfile"',
+		"      }",
+		"    }",
+		"  ]",
+		"}",
+		"```",
+		"",
+		"Available local tools:",
+		...compactSchemas,
+	]
+		.filter(Boolean)
+		.join("\n");
+}
+
+function isAutoTitleRequest(context: StreamContext): boolean {
+	const sysRaw = Array.isArray(context.systemPrompt)
+		? context.systemPrompt.join("\n")
+		: typeof context.systemPrompt === "string"
+			? context.systemPrompt
+			: "";
+	if (
+		sysRaw.includes("You name coding-agent sessions") ||
+		sysRaw.includes("Write a 3-6 word title for the task")
+	) {
+		return true;
+	}
+	for (const msg of context.messages) {
+		const text = extractMessageText(msg.content);
+		if (
+			text.includes("You name coding-agent sessions") ||
+			text.includes("Output exactly one line: the title inside `<title>` tags")
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function buildLocalAutoTitle(context: StreamContext): string {
+	const lastMsg = context.messages[context.messages.length - 1];
+	const raw = lastMsg ? extractMessageText(lastMsg.content).trim() : "";
+	const words = raw
+		.replace(/[^\w\s-]/g, " ")
+		.split(/\s+/)
+		.filter(Boolean);
+	if (words.length <= 2 && /^(hi|hello|hey|yo|tes|test|ping)\b/i.test(raw)) {
+		return "<title/>";
+	}
+	const title = words.slice(0, 5).join(" ");
+	return title ? `<title>${title}</title>` : "<title/>";
+}
+
 function formatMessagesForCopilot(
 	context: StreamContext,
 	isFirstTurnInChat: boolean,
+	needsToolsInjection: boolean,
 	pendingSummary?: string,
 ): string {
 	const chunks: string[] = [];
+	const hasTools = Boolean(context.tools && context.tools.length > 0);
+	const toolNames = hasTools ? context.tools!.map(t => t.name).join(", ") : "";
+	const sysRaw = Array.isArray(context.systemPrompt)
+		? context.systemPrompt.join("\n\n")
+		: typeof context.systemPrompt === "string"
+			? context.systemPrompt
+			: "";
+	const workspaceInfo = extractWorkspaceContextFromSystemPrompt(sysRaw);
 
 	if (isFirstTurnInChat) {
-		const sysRaw = Array.isArray(context.systemPrompt)
-			? context.systemPrompt.join("\n\n")
-			: typeof context.systemPrompt === "string"
-				? context.systemPrompt
-				: "";
-
-		if (sysRaw.trim()) {
-			const boundedSys = sysRaw.length > 45_000 ? `${sysRaw.slice(0, 45_000)}\n...[truncated]` : sysRaw;
-			chunks.push(`<system_instructions>\n${boundedSys}\n</system_instructions>`);
-		}
-
-		if (context.tools && context.tools.length > 0 && !sysRaw.includes("<tools>")) {
-			const toolLines = context.tools.map(t =>
-				JSON.stringify({
-					type: "function",
-					function: {
-						name: t.name,
-						description: t.description ?? "",
-						parameters: t.parameters ?? { type: "object", properties: {} },
-					},
-				}),
-			);
-			chunks.push(
-				[
-					"<tools>",
-					...toolLines,
-					"</tools>",
-					"When you need to call a tool, output an XML invoke block with exact tool and parameter names:",
-					'<invoke name="TOOL_NAME"><parameter name="PARAM_NAME">VALUE</parameter></invoke>',
-					"Wait for <tool_response> in the next message before continuing.",
-				].join("\n"),
-			);
+		if (hasTools) {
+			chunks.push(buildToolSpecBlock(context.tools!, workspaceInfo));
 		}
 
 		if (pendingSummary) {
-			chunks.push(`<compaction_handoff_summary>\n${pendingSummary}\n</compaction_handoff_summary>`);
+			chunks.push(`[Previous Session Summary]\n${pendingSummary}`);
 		}
 
 		for (const msg of context.messages) {
 			const text = extractMessageText(msg.content);
 			if (!text.trim()) continue;
 			if (msg.role === "toolResult") {
-				chunks.push(`<tool_response>\n${text}\n</tool_response>`);
+				const tName = msg.toolName || "tool";
+				chunks.push(
+					`[Local CLI Tool Output for "${tName}"${msg.isError ? " (ERROR)" : ""}]:\n${text}`,
+				);
 			} else if (msg.role === "assistant") {
-				chunks.push(`[Assistant]\n${text}`);
+				chunks.push(`[Previous Assistant Reply]:\n${text}`);
 			} else {
-				chunks.push(text);
+				chunks.push(`User message:\n${text}`);
 			}
 		}
 	} else {
-		// Multi-round delta: find messages after the last assistant turn
+		if (hasTools && needsToolsInjection) {
+			chunks.push(buildToolSpecBlock(context.tools!, workspaceInfo));
+		}
+
 		let lastAssistantIdx = -1;
 		for (let i = context.messages.length - 1; i >= 0; i--) {
 			if (context.messages[i].role === "assistant") {
@@ -164,31 +267,124 @@ function formatMessagesForCopilot(
 			const text = extractMessageText(msg.content);
 			if (!text.trim()) continue;
 			if (msg.role === "toolResult") {
-				chunks.push(`<tool_response>\n${text}\n</tool_response>`);
+				const tName = msg.toolName || "tool";
+				chunks.push(
+					`[Local CLI Tool Output for "${tName}"${msg.isError ? " (ERROR)" : ""}]:\n${text}\n\n(If more local tool calls are needed, output the next \`\`\`json {"omp_tool_calls": [...]} block; otherwise answer the user in plain text.)`,
+				);
 			} else {
-				chunks.push(text);
+				chunks.push(`User message:\n${text}`);
 			}
+		}
+
+		if (hasTools && !deltaMessages.some(m => m.role === "toolResult")) {
+			chunks.push(
+				`[CLI Reminder: Do NOT use your built-in Python/Code Interpreter sandbox. If this request needs local tools (${toolNames}), output a \`\`\`json code block with {"omp_tool_calls": [{"name": "...", "arguments": {...}}]} and stop.]`,
+			);
 		}
 	}
 
 	const combined = chunks.join("\n\n").trim();
-	// Copilot Chat editor enforces a 128,000-character limit
 	if (combined.length > 124_000) {
 		return combined.slice(combined.length - 124_000);
 	}
 	return combined || "Continue.";
 }
 
-function parseXmlToolCalls(text: string): {
+function parseToolCallsFromResponse(text: string): {
 	cleanText: string;
 	toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }>;
 } {
 	const toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> = [];
+	let callIdx = 1;
+	let workingText = text;
+
+	// 1. Parse ```json { "omp_tool_calls": [...] } ``` or ```omp-tool ... ``` blocks
+	const fencedRegex = /```(?:json|omp-tool)?\s*([\s\S]*?)```/gi;
+	let fMatch: RegExpExecArray | null;
+	const blocksToRemove: string[] = [];
+
+	while ((fMatch = fencedRegex.exec(text)) !== null) {
+		const candidate = fMatch[1].trim();
+		if (!candidate.startsWith("{") && !candidate.startsWith("[")) continue;
+		try {
+			const parsed: unknown = JSON.parse(candidate);
+			const list: unknown[] =
+				parsed &&
+				typeof parsed === "object" &&
+				"omp_tool_calls" in parsed &&
+				Array.isArray(parsed.omp_tool_calls)
+					? parsed.omp_tool_calls
+					: parsed &&
+						  typeof parsed === "object" &&
+						  "tool_calls" in parsed &&
+						  Array.isArray(parsed.tool_calls)
+						? parsed.tool_calls
+						: parsed &&
+							  typeof parsed === "object" &&
+							  "name" in parsed &&
+							  typeof parsed.name === "string" &&
+							  "arguments" in parsed
+							? [parsed]
+							: [];
+
+			let addedFromBlock = false;
+			for (const item of list) {
+				if (item && typeof item === "object" && "name" in item && typeof item.name === "string") {
+					const rawArgs =
+						"arguments" in item && item.arguments && typeof item.arguments === "object"
+							? (item.arguments as Record<string, unknown>)
+							: {};
+					const normalizedArgs: Record<string, unknown> = {
+						i: typeof rawArgs.i === "string" && rawArgs.i ? rawArgs.i : `Running ${item.name}`,
+						...rawArgs,
+					};
+					toolCalls.push({
+						id: `copilot_call_${Date.now()}_${callIdx++}`,
+						name: item.name,
+						arguments: normalizedArgs,
+					});
+					addedFromBlock = true;
+				}
+			}
+			if (addedFromBlock) {
+				blocksToRemove.push(fMatch[0]);
+			}
+		} catch {}
+	}
+
+	for (const blk of blocksToRemove) {
+		workingText = workingText.replace(blk, "").trim();
+	}
+
+	// 2. Also support bare JSON object if the entire response is {"omp_tool_calls": [...]}
+	if (toolCalls.length === 0 && workingText.trim().startsWith("{") && workingText.includes("omp_tool_calls")) {
+		try {
+			const parsed = JSON.parse(workingText.trim()) as {
+				omp_tool_calls?: Array<{ name?: string; arguments?: Record<string, unknown> }>;
+			};
+			if (Array.isArray(parsed.omp_tool_calls)) {
+				for (const item of parsed.omp_tool_calls) {
+					if (item && typeof item.name === "string") {
+						const rawArgs = item.arguments ?? {};
+						toolCalls.push({
+							id: `copilot_call_${Date.now()}_${callIdx++}`,
+							name: item.name,
+							arguments: {
+								i: typeof rawArgs.i === "string" && rawArgs.i ? rawArgs.i : `Running ${item.name}`,
+								...rawArgs,
+							},
+						});
+					}
+				}
+				if (toolCalls.length > 0) workingText = "";
+			}
+		} catch {}
+	}
+
+	// 3. Also support <invoke name="...">...</invoke> XML blocks as fallback
 	const invokeRegex = /<invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/invoke>/g;
 	let match: RegExpExecArray | null;
-	let callIdx = 1;
-
-	while ((match = invokeRegex.exec(text)) !== null) {
+	while ((match = invokeRegex.exec(workingText)) !== null) {
 		const toolName = match[1].trim();
 		const body = match[2];
 		const args: Record<string, unknown> = {};
@@ -196,46 +392,25 @@ function parseXmlToolCalls(text: string): {
 		let pMatch: RegExpExecArray | null;
 		while ((pMatch = paramRegex.exec(body)) !== null) {
 			const pName = pMatch[1].trim();
-			const forceString = pMatch[2];
 			const rawVal = pMatch[3];
-			if (forceString === "true") {
+			try {
+				args[pName] = JSON.parse(rawVal.trim());
+			} catch {
 				args[pName] = rawVal;
-			} else {
-				const trimmedVal = rawVal.trim();
-				if (
-					forceString === "false" ||
-					trimmedVal.startsWith("{") ||
-					trimmedVal.startsWith("[") ||
-					trimmedVal === "true" ||
-					trimmedVal === "false" ||
-					/^-?\d+(\.\d+)?$/.test(trimmedVal)
-				) {
-					try {
-						args[pName] = JSON.parse(trimmedVal);
-					} catch {
-						args[pName] = rawVal;
-					}
-				} else {
-					args[pName] = rawVal;
-				}
 			}
 		}
+		if (typeof args.i !== "string") args.i = `Running ${toolName}`;
 		toolCalls.push({
 			id: `copilot_call_${Date.now()}_${callIdx++}`,
 			name: toolName,
 			arguments: args,
 		});
 	}
+	if (toolCalls.length > 0) {
+		workingText = workingText.replace(invokeRegex, "").trim();
+	}
 
-	const cleanText =
-		toolCalls.length > 0
-			? text
-					.replace(/<\/?(?:tool_calls|function_calls)>/g, "")
-					.replace(invokeRegex, "")
-					.trim()
-			: text;
-
-	return { cleanText, toolCalls };
+	return { cleanText: workingText, toolCalls };
 }
 
 function formatQuotaSummary(throttling?: CopilotThrottlingInfo): string {
@@ -272,6 +447,7 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 				modelId: config.defaultModel,
 				requireNewChat: config.autoNewChatPerSession,
 				seededMessageCount: 0,
+				toolsInjected: false,
 			};
 			sessionStates.set(sessionId, state);
 		}
@@ -311,7 +487,7 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 			name: m.name,
 			reasoning: m.reasoning,
 			input: ["text"],
-			supportsTools: false,
+			supportsTools: true,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: m.contextWindow,
 			maxTokens: m.maxTokens,
@@ -356,7 +532,7 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 			const stream = new AssistantMessageEventStream();
 			const context = rawContext as unknown as StreamContext;
 			const options = (rawOptions ?? {}) as StreamOptions;
-			const sid = options.sessionId || activeSessionId || "default";
+			const sid = activeSessionId || "default";
 			const state = getOrCreateSessionState(sid);
 
 			const assistantMsg = {
@@ -420,20 +596,46 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 				};
 
 				try {
+					// Intercept omp's background auto-title request so it never resets or pollutes the browser's Copilot chat!
+					if (isAutoTitleRequest(context)) {
+						const titleText = buildLocalAutoTitle(context);
+						stream.push({ type: "start", partial: assistantMsg });
+						textIndex = assistantMsg.content.push({ type: "text", text: titleText }) - 1;
+						stream.push({
+							type: "text_start",
+							contentIndex: textIndex,
+							partial: assistantMsg,
+						});
+						stream.push({
+							type: "text_delta",
+							contentIndex: textIndex,
+							delta: titleText,
+							partial: assistantMsg,
+						});
+						closeText();
+						assistantMsg.duration = performance.now() - startedAt;
+						stream.push({
+							type: "done",
+							reason: "stop",
+							message: assistantMsg,
+						});
+						stream.end();
+						return;
+					}
+
 					config = loadConfig();
 					const hasPriorAssistantInContext = context.messages.some(m => m.role === "assistant");
-					const isFirstTurnInChat =
-						state.requireNewChat || state.seededMessageCount === 0 || !hasPriorAssistantInContext;
+					const isFirstTurnInChat = state.requireNewChat || !hasPriorAssistantInContext;
+					const hasDirectTools = Boolean(context.tools && context.tools.length > 0);
 
 					const promptText = formatMessagesForCopilot(
 						context,
 						isFirstTurnInChat,
+						!state.toolsInjected,
 						state.seededSummary,
 					);
 
 					stream.push({ type: "start", partial: assistantMsg });
-
-					const hasDirectTools = Boolean(context.tools && context.tools.length > 0);
 
 					const result = await streamCopilotPrompt(
 						promptText,
@@ -465,7 +667,6 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 							},
 							onTextDelta: delta => {
 								if (hasDirectTools) {
-									// Buffer text until completion if we need to strip/parse direct <invoke> tags
 									assistantMsg.ttft ??= performance.now() - startedAt;
 									return;
 								}
@@ -496,9 +697,9 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 
 					closeThinking();
 
-					if (hasDirectTools) {
-						const { cleanText, toolCalls } = parseXmlToolCalls(result.text);
-						if (cleanText) {
+					const { cleanText, toolCalls } = parseToolCallsFromResponse(result.text);
+					if (cleanText) {
+						if (textIndex === undefined) {
 							textIndex = assistantMsg.content.push({ type: "text", text: cleanText }) - 1;
 							stream.push({
 								type: "text_start",
@@ -511,48 +712,50 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 								delta: cleanText,
 								partial: assistantMsg,
 							});
-							closeText();
 						}
-						for (const tc of toolCalls) {
-							const tcIndex =
-								assistantMsg.content.push({
-									type: "toolCall",
-									id: tc.id,
-									name: tc.name,
-									arguments: tc.arguments,
-								}) - 1;
-							const serializedArgs = JSON.stringify(tc.arguments);
-							stream.push({
-								type: "toolcall_start",
-								contentIndex: tcIndex,
-								partial: assistantMsg,
-							});
-							stream.push({
-								type: "toolcall_delta",
-								contentIndex: tcIndex,
-								delta: serializedArgs,
-								partial: assistantMsg,
-							});
-							const block = assistantMsg.content[tcIndex];
-							if (block && block.type === "toolCall") {
-								stream.push({
-									type: "toolcall_end",
-									contentIndex: tcIndex,
-									toolCall: block,
-									partial: assistantMsg,
-								});
-							}
-						}
-						if (toolCalls.length > 0) {
-							assistantMsg.stopReason = "toolUse";
-						}
+						closeText();
 					} else {
 						closeText();
+					}
+
+					for (const tc of toolCalls) {
+						const tcIndex =
+							assistantMsg.content.push({
+								type: "toolCall",
+								id: tc.id,
+								name: tc.name,
+								arguments: tc.arguments,
+							}) - 1;
+						const serializedArgs = JSON.stringify(tc.arguments);
+						stream.push({
+							type: "toolcall_start",
+							contentIndex: tcIndex,
+							partial: assistantMsg,
+						});
+						stream.push({
+							type: "toolcall_delta",
+							contentIndex: tcIndex,
+							delta: serializedArgs,
+							partial: assistantMsg,
+						});
+						const block = assistantMsg.content[tcIndex];
+						if (block && block.type === "toolCall") {
+							stream.push({
+								type: "toolcall_end",
+								contentIndex: tcIndex,
+								toolCall: block,
+								partial: assistantMsg,
+							});
+						}
+					}
+					if (toolCalls.length > 0) {
+						assistantMsg.stopReason = "toolUse";
 					}
 
 					state.requireNewChat = false;
 					state.seededSummary = undefined;
 					state.seededMessageCount = context.messages.length + 1;
+					if (hasDirectTools) state.toolsInjected = true;
 					state.modelId = model.id;
 					if (result.conversationId) {
 						state.copilotConversationId = result.conversationId;
@@ -565,7 +768,6 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 							timestamp: Date.now(),
 						} satisfies PersistedSessionState);
 					} catch {}
-
 					const estInput = Math.ceil(promptText.length / 4);
 					const estOutput = Math.ceil(result.text.length / 4);
 					assistantMsg.usage.input = estInput;
@@ -877,9 +1079,9 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 
 			const runCapture = async () => {
 				ctx.ui.notify(`Connecting to browser & capturing cookies for ${config.email}...`, "info");
-				const res = await exportAndSaveCookies(config);
+				const res = await exportAndSaveCookies(config, true);
 				ctx.ui.notify(
-					`Saved ${res.count} cookies for ${res.email} to ${COOKIES_PATH}`,
+					`Saved ${res.count} cookies for ${res.email} to ${COOKIES_PATH} (synced to headless browser)`,
 					"info",
 				);
 			};
@@ -893,6 +1095,7 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 						`🌐 Copilot ITS Setup & Cookie Callback Server running:`,
 						`  Dashboard: ${srv.url}`,
 						`  Callback:  ${srv.url}/callback`,
+						`  Backend:   ${config.browserBackend}`,
 						`  Cookies:   ${COOKIES_PATH}`,
 					].join("\n"),
 					"info",
@@ -908,13 +1111,33 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 				await runCapture();
 				return;
 			}
+			if (sub === "chromium" || sub === "standalone" || sub === "headless") {
+				config = saveConfig({ ...config, browserBackend: "standalone-chromium" });
+				const wsUrl = await ensureStandaloneChromium(config, false);
+				ctx.ui.notify(`Switched backend to standalone headless Chromium (${wsUrl})`, "info");
+				return;
+			}
+			if (sub === "obscura") {
+				ctx.ui.notify("Installing/starting Obscura headless engine...", "info");
+				const binPath = await installObscuraBinary(msg => ctx.ui.notify(msg, "info"));
+				config = saveConfig({ ...config, browserBackend: "obscura" });
+				const wsUrl = await ensureObscuraServer(config);
+				ctx.ui.notify(`Obscura ready (${binPath}) at ${wsUrl}`, "info");
+				return;
+			}
+			if (sub === "relay") {
+				config = saveConfig({ ...config, browserBackend: "relay" });
+				ctx.ui.notify("Switched backend to OMP Browser Relay (ws://127.0.0.1:9224/cdp)", "info");
+				return;
+			}
 			if (sub === "status") {
 				const st = await getCopilotStatus(config);
 				const store = loadCookieStore();
 				ctx.ui.notify(
 					[
 						`🔗 Copilot ITS Status`,
-						`  Connected:  ${st.connected ? `🟢 yes (${st.mode})` : `🔴 no (${st.error || "disconnected"})`}`,
+						`  Backend:    ${config.browserBackend} (active: ${st.mode})`,
+						`  Connected:  ${st.connected ? `🟢 yes (${st.cdpUrl})` : `🔴 no (${st.error || "disconnected"})`}`,
 						`  Account:    ${st.email || config.email}`,
 						`  UI Model:   ${st.activeModel || config.defaultModel}`,
 						`  Chat ID:    ${st.conversationId || "-"}`,
@@ -929,11 +1152,11 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 			// Interactive setup wizard
 			const srv = await runServer();
 			const choice = await ctx.ui.select(
-				`Copilot ITS Setup (Callback server live at ${srv.url})`,
+				`Copilot ITS Setup (Backend: ${config.browserBackend} | Server: ${srv.url})`,
 				[
-					`1. Auto-login & capture cookies from active Browser Relay (${config.email})`,
-					`2. Open ${srv.url} setup dashboard in browser`,
-					`3. Configure ITS email & session behavior`,
+					`1. Switch headless backend (Standalone Chromium / Obscura / Browser Relay)`,
+					`2. Capture cookies from Browser Relay into headless profile (${config.email})`,
+					`3. Configure ITS email & session/compaction behavior`,
 					`4. Check connection & quota status`,
 					`5. Done (keep ${srv.url} running)`,
 				],
@@ -942,13 +1165,30 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 			if (!choice || choice.startsWith("5.")) return;
 
 			if (choice.startsWith("1.")) {
-				await runCapture();
+				const backendChoice = await ctx.ui.select("Select Browser Backend:", [
+					"standalone-chromium — Dedicated headless Chromium with saved cookies (Recommended, never touches your browser)",
+					"obscura — Rust Obscura headless engine (https://github.com/h4ckf0r0day/obscura)",
+					"relay — OMP Browser Relay (ws://127.0.0.1:9224/cdp)",
+				]);
+				if (!backendChoice) return;
+				const selectedBackend: BrowserBackendMode = backendChoice.startsWith("obscura")
+					? "obscura"
+					: backendChoice.startsWith("relay")
+						? "relay"
+						: "standalone-chromium";
+				config = saveConfig({ ...config, browserBackend: selectedBackend });
+				if (selectedBackend === "obscura") {
+					const binPath = await installObscuraBinary(msg => ctx.ui.notify(msg, "info"));
+					const wsUrl = await ensureObscuraServer(config);
+					ctx.ui.notify(`Switched to Obscura (${binPath}) at ${wsUrl}`, "info");
+				} else if (selectedBackend === "standalone-chromium") {
+					const wsUrl = await ensureStandaloneChromium(config, false);
+					ctx.ui.notify(`Switched to standalone headless Chromium (${wsUrl})`, "info");
+				} else {
+					ctx.ui.notify("Switched to OMP Browser Relay", "info");
+				}
 			} else if (choice.startsWith("2.")) {
-				const status = await getCopilotStatus(config);
-				ctx.ui.notify(
-					`Setup server is live at ${srv.url} (POST cookies to ${srv.url}/callback). Relay connected=${status.connected}`,
-					"info",
-				);
+				await runCapture();
 			} else if (choice.startsWith("3.")) {
 				const newEmail = await ctx.ui.input("ITS Student Email:", config.email);
 				if (newEmail !== undefined && newEmail.trim()) {
@@ -970,7 +1210,7 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 					});
 				}
 				ctx.ui.notify(
-					`Updated config: email=${config.email}, autoNewChat=${config.autoNewChatPerSession}, autoCompact=${config.autoCompactHandoff}`,
+					`Updated config: email=${config.email}, backend=${config.browserBackend}, autoNewChat=${config.autoNewChatPerSession}, autoCompact=${config.autoCompactHandoff}`,
 					"info",
 				);
 			} else if (choice.startsWith("4.")) {
@@ -979,7 +1219,8 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(
 					[
 						`🔗 Copilot ITS Status`,
-						`  Connected:  ${st.connected ? `🟢 yes (${st.mode})` : `🔴 no (${st.error || "disconnected"})`}`,
+						`  Backend:    ${config.browserBackend} (active: ${st.mode})`,
+						`  Connected:  ${st.connected ? `🟢 yes (${st.cdpUrl})` : `🔴 no (${st.error || "disconnected"})`}`,
 						`  Account:    ${st.email || config.email}`,
 						`  UI Model:   ${st.activeModel || config.defaultModel}`,
 						`  Chat ID:    ${st.conversationId || "-"}`,
