@@ -1,4 +1,4 @@
-import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
+import { createAssistantMessageEventStream, type StopReason } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
 	type BrowserBackendMode,
@@ -529,7 +529,7 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 			},
 		},
 		streamSimple(model, rawContext, rawOptions) {
-			const stream = new AssistantMessageEventStream();
+			const stream = createAssistantMessageEventStream();
 			const context = rawContext as unknown as StreamContext;
 			const options = (rawOptions ?? {}) as StreamOptions;
 			const sid = activeSessionId || "default";
@@ -553,7 +553,7 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 					totalTokens: 0,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
-				stopReason: "stop" as "stop" | "length" | "toolUse" | "error" | "aborted",
+				stopReason: "stop" as StopReason,
 				timestamp: Date.now(),
 				duration: 0,
 				ttft: undefined as number | undefined,
@@ -775,21 +775,29 @@ export default function copilotItsExtension(pi: ExtensionAPI): void {
 					assistantMsg.usage.totalTokens = estInput + estOutput;
 					assistantMsg.duration = performance.now() - startedAt;
 
+					const doneReason: "stop" | "length" | "toolUse" =
+						assistantMsg.stopReason === "toolUse"
+							? "toolUse"
+							: assistantMsg.stopReason === "length"
+								? "length"
+								: "stop";
+
 					stream.push({
 						type: "done",
-						reason: assistantMsg.stopReason,
+						reason: doneReason,
 						message: assistantMsg,
 					});
 					stream.end();
 				} catch (err) {
 					closeThinking();
 					closeText();
-					assistantMsg.stopReason = options.signal?.aborted ? "aborted" : "error";
+					const errorReason: "aborted" | "error" = options.signal?.aborted ? "aborted" : "error";
+					assistantMsg.stopReason = errorReason;
 					assistantMsg.errorMessage = err instanceof Error ? err.message : String(err);
 					assistantMsg.duration = performance.now() - startedAt;
 					stream.push({
 						type: "error",
-						reason: assistantMsg.stopReason,
+						reason: errorReason,
 						error: assistantMsg,
 					});
 					stream.end();

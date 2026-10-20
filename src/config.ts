@@ -164,7 +164,7 @@ export function saveCookieStore(store: CopilotCookieStore): number {
 
 function isCookieRecord(val: unknown): val is Record<string, unknown> & { name: string; value: string } {
 	return (
-		Boolean(val) &&
+		val !== null &&
 		typeof val === "object" &&
 		"name" in val &&
 		typeof val.name === "string" &&
